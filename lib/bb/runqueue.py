@@ -1941,7 +1941,8 @@ class RunQueueExecute:
         for scheduler in schedulers:
             if self.scheduler == scheduler.name:
                 self.sched = scheduler(self, self.rqdata)
-                logger.debug("Using runqueue scheduler '%s'", scheduler.name)
+                bb.note("Runqueue scheduler '%s' with BB_NUMBER_THREADS=%d" %
+                        (scheduler.name, self.number_tasks))
                 break
         else:
             bb.fatal("Invalid scheduler '%s'.  Available schedulers: %s" %
