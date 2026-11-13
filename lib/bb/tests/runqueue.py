@@ -63,6 +63,33 @@ class RunQueueTests(unittest.TestCase):
 
             self.shutdown(tempdir)
 
+    def test_tetris(self):
+        for dynamic in ("0", "1"):
+            for sstatevalid in ("", self.a1_sstatevalid):
+                with self.subTest(dynamic=dynamic, sstatevalid=sstatevalid):
+                    with tempfile.TemporaryDirectory(prefix="runqueuetest") as tempdir:
+                        extraenv = {
+                            "BB_SCHEDULERS": "bb.tetris.RunQueueSchedulerTetris",
+                            "BB_SCHEDULER": "tetris",
+                            "BB_TETRIS_DYNAMIC": dynamic,
+                        }
+                        try:
+                            tasks = self.run_bitbakecmd(
+                                ["bitbake", "a1"], tempdir, sstatevalid, extraenv=extraenv
+                            )
+                            if sstatevalid:
+                                expected = [
+                                    "a1:package_qa_setscene", "a1:packagedata_setscene",
+                                    "a1:package_write_rpm_setscene", "a1:package_write_ipk_setscene",
+                                    "a1:populate_sysroot_setscene", "a1:build",
+                                ]
+                            else:
+                                expected = ["a1:" + task for task in self.alltasks]
+                            self.assertEqual(set(tasks), set(expected))
+                            self.assertEqual(len(tasks), len(set(tasks)))
+                        finally:
+                            self.shutdown(tempdir)
+
     def test_single_setscenevalid(self):
         with tempfile.TemporaryDirectory(prefix="runqueuetest") as tempdir:
             cmd = ["bitbake", "a1"]

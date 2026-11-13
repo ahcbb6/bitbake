@@ -1,7 +1,15 @@
 #
 # Tetris runqueue scheduler for BitBake.
 #
-# Ranks tasks by a combined "real_weight" that fuses:
+# Adaptive selection favors remaining critical-path seconds. When at most two
+# workers' worth of tasks are eligible, a short final prerequisite can get an
+# unlock-rate boost. At most one such dispatch precedes a path-first dispatch,
+# and its estimated duration must fit within 5% of the leading remaining path.
+# Eligible waiting time is added to path priority to prevent repeated bypasses.
+# Completed work has zero remaining cost; setscene-covered work has zero own
+# cost but still carries its downstream path until BitBake processes the skip.
+#
+# The static tie-break (or full policy with BB_TETRIS_DYNAMIC = "0") fuses:
 #   * weight_time    -- log10-normalized elapsed time, computed on the fly
 #                       from ${TMPDIR}/buildstats (written by buildstats.bbclass
 #                       during previous builds in this TMPDIR)
@@ -18,7 +26,7 @@
 #
 # The default coefficients (alpha=0.5, beta=3.0) and aggregation ('max') were
 # picked via grid search on core-image-minimal buildstats; see
-# contrib/simulate_schedule.py --sweep. The winning intuition is:
+# contrib/simulate_schedule.py --sweep --no-tetris-dynamic. The original intuition is:
 #   * downstream criticality (unblock_score) matters much more than a task's
 #     own duration
 #   * 'max' aggregation ranks "unlocks the critical downstream child" above
@@ -31,7 +39,7 @@
 #   BB_SCHEDULERS     += "bb.tetris.RunQueueSchedulerTetris"
 #   BB_SCHEDULER       = "tetris"
 #
-# Fetch tasks are handled specially. Historical do_fetch elapsed times swing
+# Optional fetch deferral is disabled by default. Historical do_fetch times swing
 # by 100x depending on cache hits vs. network, so their own duration is a poor
 # priority signal. Instead, we compute a PERT critical-path slack per task
 # from raw buildstats seconds, and any do_fetch whose slack exceeds a small
@@ -39,14 +47,15 @@
 # deferred task, so it only runs when a worker would otherwise be idle. Fetches
 # on (or near) the critical path retain their normal priority.
 #
-# Optional tuning knobs (all have sane defaults from the sweep):
+# Optional tuning knobs (the static coefficients came from the original sweep):
 #
+#   BB_TETRIS_DYNAMIC          = "1"      # 0 restores static priority selection
 #   BB_TETRIS_ALPHA            = "0.5"    # weight_time coefficient
 #   BB_TETRIS_BETA             = "3.0"    # unblock_score coefficient
 #   BB_TETRIS_AGG              = "max"    # 'max' or 'sum' downstream aggregation
 #   BB_TETRIS_RESOLUTION       = "20"     # log-quantization buckets (sweep-optimum)
 #   BB_TETRIS_BUILDSTATS       = "${TMPDIR}/buildstats"   # override source dir
-#   BB_TETRIS_DEFER_FETCH      = "1"      # 0 to disable fetch-deferral entirely
+#   BB_TETRIS_DEFER_FETCH      = "0"      # 1 enables experimental fetch deferral
 #   BB_TETRIS_FETCH_SLACK_PCT  = "1.0"    # slack > pct*makespan => defer fetch
 #
 # SPDX-License-Identifier: MIT
@@ -56,6 +65,7 @@ import logging
 import math
 import os
 import re
+import time
 
 from bb.runqueue import RunQueueScheduler, split_tid_mcfn
 
@@ -66,7 +76,7 @@ logger = logging.getLogger("BitBake.RunQueue.Tetris")
 # only tasks, or when no buildstats exist yet).
 DEFAULT_WEIGHT_TIME = 4
 
-# Sweep-derived defaults; see module docstring above.
+# Static sweep-derived defaults; see module docstring above.
 DEFAULT_ALPHA = 0.5
 DEFAULT_BETA = 3.0
 DEFAULT_AGG = "max"
@@ -78,11 +88,11 @@ DEFAULT_AGG = "max"
 # ordering breaks a helpful accidental tie-break.
 DEFAULT_RESOLUTION = 20
 
-# Defer non-critical do_fetch tasks so they only run when workers would be
-# idle. Slack threshold expressed as a percentage of the estimated makespan
-# from PERT analysis on the live DAG + buildstats durations.
-DEFAULT_DEFER_FETCH = True
+# Optional experimental deferral of non-critical fetches. Keep it disabled
+# by default: delaying a fetch can postpone the work that would fill workers.
+DEFAULT_DEFER_FETCH = False
 DEFAULT_FETCH_SLACK_PCT = 1.0
+DEFAULT_DYNAMIC = True
 
 # Clamp for log10; 10ms is well below any scheduling-relevant granularity.
 _MIN_ELAPSED = 0.01
@@ -97,15 +107,129 @@ _PN_RE = re.compile(r'^(?P<pn>.+)-[^-]+-r\d+$')
 _TIMESTAMP_RE = re.compile(r'^\d{10,}$')
 
 
+def estimate_task_durations(task_keys, timings):
+    """Estimate seconds using observed times, task-kind medians, then global median."""
+    if not timings:
+        return {tid: 1.0 for tid in task_keys}
+    by_task = {}
+    for (_pn, task), value in timings.items():
+        if value > 0:
+            by_task.setdefault(task, []).append(value)
+    medians = {
+        task: sorted(values)[len(values) // 2]
+        for task, values in by_task.items()
+    }
+    positive = sorted(value for value in timings.values() if value > 0)
+    fallback = positive[len(positive) // 2] if positive else _MIN_ELAPSED
+    return {
+        tid: max(_MIN_ELAPSED, timings[key] if timings.get(key, 0) > 0
+                 else medians.get(key[1], fallback))
+        for tid, key in task_keys.items()
+    }
+
+
+class TetrisPriority:
+    """Stateful priority policy shared by the runqueue and discrete-event simulator."""
+
+    def __init__(self, depends, revdeps, duration, priority, deferred=()):
+        self.depends = depends
+        self.revdeps = revdeps
+        self.duration = duration
+        self.rank = {tid: rank for rank, tid in enumerate(priority)}
+        self.deferred = set(deferred)
+        self.remaining = {tid: len(deps) for tid, deps in depends.items()}
+        indegree = self.remaining.copy()
+        ready = [tid for tid, count in indegree.items() if not count]
+        self.topo = []
+        while ready:
+            tid = ready.pop()
+            self.topo.append(tid)
+            for child in revdeps[tid]:
+                indegree[child] -= 1
+                if indegree[child] == 0:
+                    ready.append(child)
+        if len(self.topo) != len(depends):
+            raise ValueError("Tetris: dependency graph contains a cycle")
+        self.completed = set()
+        self.covered = set()
+        self.waiting = {}
+        self.unlock_bypass = False
+        self.last_reason = None
+        self.path = {}
+        self._update_paths()
+
+    def _update_paths(self):
+        for tid in reversed(self.topo):
+            if tid in self.completed:
+                self.path[tid] = 0.0
+            else:
+                own = 0.0 if tid in self.covered else self.duration[tid]
+                self.path[tid] = own + max(
+                    (self.path[child] for child in self.revdeps[tid]), default=0.0
+                )
+
+    def select(self, eligible, completed, covered, workers, now):
+        if len(completed) != len(self.completed):
+            for tid in completed.difference(self.completed):
+                for child in self.revdeps[tid]:
+                    self.remaining[child] -= 1
+                # All predecessors of a completed task are also complete.
+                # No pending ancestor path needs recalculation here.
+                self.path[tid] = 0.0
+            self.completed = set(completed)
+        if covered != self.covered:
+            self.covered = set(covered)
+            self._update_paths()
+
+        eligible = set(eligible)
+        self.waiting = {tid: self.waiting.get(tid, now) for tid in eligible}
+        skipped = eligible.intersection(covered)
+        if skipped:
+            self.last_reason = "covered"
+            return min(skipped, key=self.rank.__getitem__)
+
+        candidates = eligible.difference(self.deferred) or eligible
+        critical = max(
+            candidates,
+            key=lambda tid: (self.path[tid] + now - self.waiting[tid],
+                             self.path[tid], -self.rank[tid]),
+        )
+        selected = critical
+        self.last_reason = "critical-path"
+        if len(eligible) <= 2 * workers and not self.unlock_bypass:
+            budget = self.path[critical] * 0.05
+            best = None
+            for tid in candidates:
+                if self.duration[tid] > budget:
+                    continue
+                gain = sum(
+                    self.duration[child] for child in self.revdeps[tid]
+                    if self.remaining[child] == 1
+                    and child not in self.completed and child not in covered
+                )
+                if gain <= 0:
+                    continue
+                score = (gain / self.duration[tid], self.path[tid], -self.rank[tid])
+                if best is None or score > best[0]:
+                    best = (score, tid)
+            if best is not None:
+                selected = best[1]
+                if selected != critical:
+                    self.last_reason = "unlock"
+        self.unlock_bypass = selected != critical
+        self.waiting.pop(selected)
+        return selected
+
+
 class RunQueueSchedulerTetris(RunQueueScheduler):
-    """Priority = alpha*weight_time + beta*unblock_score, computed on the live task graph."""
+    """Adaptive path/unlock scheduling, with the original static score as tie-break."""
 
     name = "tetris"
 
     def __init__(self, runqueue, rqdata):
         RunQueueScheduler.__init__(self, runqueue, rqdata)
 
-        alpha, beta, agg, resolution, defer_fetch, fetch_slack_pct = (
+        alpha, beta, agg, resolution, defer_fetch, fetch_slack_pct, dynamic = (
             self._resolve_tunables()
         )
 
@@ -177,6 +301,14 @@ class RunQueueSchedulerTetris(RunQueueScheduler):
             key=lambda t: (t not in deferred, real_weight[t], wt_by_tid[t]),
             reverse=True,
         )
+        self.rev_prio_map = {tid: rank for rank, tid in enumerate(self.prio_map)}
+        self.priority = None
+        if dynamic:
+            self.priority = TetrisPriority(
+                {tid: entry.depends for tid, entry in self.rqdata.runtaskentries.items()},
+                {tid: entry.revdeps for tid, entry in self.rqdata.runtaskentries.items()},
+                self._estimate_durations(timings), self.prio_map, deferred,
+            )
 
         # Summary logging so users can sanity-check what the scheduler picked up.
         n_fetch = sum(1 for t in task_of.values() if t == 'do_fetch')
@@ -196,6 +328,17 @@ class RunQueueSchedulerTetris(RunQueueScheduler):
             for t in self.prio_map[:5]
         )
         logger.debug("Tetris: top 5 by real_weight: %s", top)
+
+    def select_buildable_task(self, buildable):
+        if self.priority is None:
+            return super().select_buildable_task(buildable)
+        tid = self.priority.select(
+            buildable, self.rq.runq_complete, self.rq.tasks_covered,
+            self.rq.number_tasks, time.monotonic(),
+        )
+        logger.debug("Tetris: eligible=%d selected=%s reason=%s remaining_path=%.2fs",
+                     len(buildable), tid, self.priority.last_reason, self.priority.path[tid])
+        return tid
 
     # ------------------------------------------------------------------ helpers
 
@@ -237,7 +380,8 @@ class RunQueueSchedulerTetris(RunQueueScheduler):
         resolution = _i("BB_TETRIS_RESOLUTION", DEFAULT_RESOLUTION)
         defer_fetch = _b("BB_TETRIS_DEFER_FETCH", DEFAULT_DEFER_FETCH)
         fetch_slack_pct = _f("BB_TETRIS_FETCH_SLACK_PCT", DEFAULT_FETCH_SLACK_PCT)
-        return alpha, beta, agg, resolution, defer_fetch, fetch_slack_pct
+        dynamic = _b("BB_TETRIS_DYNAMIC", DEFAULT_DYNAMIC)
+        return alpha, beta, agg, resolution, defer_fetch, fetch_slack_pct, dynamic
 
     def _resolve_buildstats_path(self):
         """Return the buildstats base directory to scan, or None.
@@ -450,33 +594,10 @@ class RunQueueSchedulerTetris(RunQueueScheduler):
         recipes); failing that, the global median. Missing/zero timings clamp
         to _MIN_ELAPSED so slack math stays well-defined.
         """
-        entries = self.rqdata.runtaskentries
-        if not timings:
-            return {tid: 1.0 for tid in entries}
-
-        by_task = {}
-        for (_pn, task), v in timings.items():
-            if v > 0:
-                by_task.setdefault(task, []).append(v)
-        task_median = {}
-        for task, vs in by_task.items():
-            vs.sort()
-            task_median[task] = vs[len(vs) // 2]
-
-        all_vals = sorted(v for v in timings.values() if v > 0)
-        global_median = all_vals[len(all_vals) // 2] if all_vals else _MIN_ELAPSED
-
-        out = {}
-        for tid in entries:
-            pn, task = self._pn_task_for_tid(tid)
-            key = (pn, task)
-            if key in timings and timings[key] > 0:
-                out[tid] = max(timings[key], _MIN_ELAPSED)
-            elif task in task_median:
-                out[tid] = max(task_median[task], _MIN_ELAPSED)
-            else:
-                out[tid] = max(global_median, _MIN_ELAPSED)
-        return out
+        return estimate_task_durations(
+            {tid: self._pn_task_for_tid(tid) for tid in self.rqdata.runtaskentries},
+            timings,
+        )
 
     def _compute_slack(self, duration, topo):
         """PERT slack per tid, in seconds. Returns (slack, makespan_estimate).

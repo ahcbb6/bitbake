@@ -270,35 +270,29 @@ class RunQueueScheduler(object):
             else:
                 skip_buildable[rtaskname] = 1
 
-        if len(buildable) == 1:
-            tid = buildable.pop()
+        eligible = set()
+        active_stamps = set(self.rq.build_stamps.values())
+        for tid in buildable:
             taskname = taskname_from_tid(tid)
             if taskname in skip_buildable and skip_buildable[taskname] >= int(self.skip_maxthread[taskname]):
-                return None
-            stamp = self.stamps[tid]
-            if stamp not in self.rq.build_stamps.values():
-                return tid
+                continue
+            if self.stamps[tid] not in active_stamps:
+                eligible.add(tid)
+        if not eligible:
+            return None
+        return self.select_buildable_task(eligible)
+
+    def select_buildable_task(self, buildable):
+        """Choose among tasks which passed all runqueue eligibility checks."""
+        if len(buildable) == 1:
+            return next(iter(buildable))
 
         if not self.rev_prio_map:
             self.rev_prio_map = {}
             for tid in self.rqdata.runtaskentries:
                 self.rev_prio_map[tid] = self.prio_map.index(tid)
 
-        best = None
-        bestprio = None
-        for tid in buildable:
-            prio = self.rev_prio_map[tid]
-            if bestprio is None or bestprio > prio:
-                taskname = taskname_from_tid(tid)
-                if taskname in skip_buildable and skip_buildable[taskname] >= int(self.skip_maxthread[taskname]):
-                    continue
-                stamp = self.stamps[tid]
-                if stamp in self.rq.build_stamps.values():
-                    continue
-                bestprio = prio
-                best = tid
-
-        return best
+        return min(buildable, key=self.rev_prio_map.__getitem__)
 
     def next(self):
         """
