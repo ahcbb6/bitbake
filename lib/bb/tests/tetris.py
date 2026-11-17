@@ -4,13 +4,16 @@
 
 import importlib.util
 import io
+import shutil
+import sqlite3
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from bb.runqueue import RunQueueScheduler
-from bb.tetris import RunQueueSchedulerTetris, TetrisPriority
+from bb.tetris import RunQueueSchedulerTetris, TetrisPriority, estimate_task_durations
 
 
 spec = importlib.util.spec_from_file_location(
@@ -19,6 +22,150 @@ spec = importlib.util.spec_from_file_location(
 )
 simulator = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(simulator)
+
+
+class TetrisHistoryTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix="tetris-history-")
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.stats = self.root / "tmp" / "buildstats"
+        self.config = {
+            "TOPDIR": str(self.root), "MACHINE": "qemux86-64",
+            "BB_NUMBER_THREADS": "8", "PARALLEL_MAKE": "-j 8",
+        }
+
+    def load(self, base=None, version=None):
+        cfg = SimpleNamespace(getVar=self.config.get)
+        scheduler = RunQueueSchedulerTetris.__new__(RunQueueSchedulerTetris)
+        scheduler.rq = SimpleNamespace(
+            cfgData=cfg,
+            cooker=SimpleNamespace(databuilder=SimpleNamespace(mcdata={"": cfg})),
+        )
+        scheduler.rqdata = SimpleNamespace(runtaskentries={}, dataCaches={})
+        if version:
+            scheduler.rqdata.runtaskentries = {"/llvm.bb:do_compile": None}
+            scheduler.rqdata.dataCaches = {"": SimpleNamespace(
+                pkg_fn={"/llvm.bb": "llvm-native"},
+                pkg_pepvpr={"/llvm.bb": ("0", version, "r0")},
+            )}
+        return scheduler._load_timings_from_buildstats(str(base or self.stats))[0]
+
+    def record(self, snapshot, recipe, task, elapsed, ended, status="PASSED"):
+        path = self.stats / snapshot / recipe / task
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as stream:
+            stream.write(
+                f"Event: TaskStarted\nStarted: {ended - elapsed}\n"
+                f"Elapsed time: {elapsed} seconds\nStatus: {status}\nEnded: {ended}\n"
+            )
+        return path
+
+    def test_compile_restore_rebuild_retains_estimate_outside_tmp(self):
+        self.record("20260101000000", "llvm-native-22.1.3-r0",
+                    "do_compile", 7500, 10000)
+        self.assertEqual(self.load()[("llvm-native", "do_compile")], 7500)
+        shutil.rmtree(self.root / "tmp")
+        self.record("20260102000000", "llvm-native-22.1.3-r0",
+                    "do_populate_sysroot_setscene", 0.5, 20000)
+        self.record("20260102000000", "small-1.0-r0", "do_compile", 13, 20001)
+        timings = self.load()
+        self.assertEqual(timings[("llvm-native", "do_populate_sysroot_setscene")], 0.5)
+        self.assertEqual(
+            estimate_task_durations({"llvm": ("llvm-native", "do_compile")}, timings),
+            {"llvm": 7500},
+        )
+        shutil.rmtree(self.root / "tmp")
+        with self.assertLogs("BitBake.RunQueue.Tetris", level="WARNING"):
+            self.assertEqual(self.load()[("llvm-native", "do_compile")], 7500)
+
+    def test_successful_samples_across_snapshots_retries_and_versions(self):
+        self.record("20260101000000", "llvm-native-22.1.3-r0",
+                    "do_compile", 7500, 10000)
+        self.record("20260102000000", "llvm-native-22.1.8-r0",
+                    "do_compile", 6000, 20000)
+        path = self.record("20260102000000", "llvm-native-22.1.8-r0",
+                           "do_compile", 50, 21000, status="FAILED")
+        with path.open("a") as stream:
+            stream.write("Event: TaskStarted\nStarted: 22000\n")
+        (self.stats / "20260103000000").mkdir()
+        self.assertEqual(self.load()[("llvm-native", "do_compile")], 6000)
+        # Reimporting an older archive must not replace a newer persisted value.
+        self.assertEqual(
+            self.load(self.stats / "20260101000000")[("llvm-native", "do_compile")], 6000
+        )
+        self.record("20260104000000", "llvm-native-22.1.8-r0",
+                    "do_compile", 5500, 30000)
+        self.assertEqual(self.load()[("llvm-native", "do_compile")], 5750)
+        self.assertEqual(self.load(version="22.1.3")[("llvm-native", "do_compile")], 7500)
+        self.assertEqual(self.load(version="22.1.8")[("llvm-native", "do_compile")], 5750)
+        self.assertEqual(self.load(version="23.0.0")[("llvm-native", "do_compile")], 5750)
+
+    def test_rolling_median_evicts_old_samples_and_deduplicates_imports(self):
+        key = ("llvm-native", "do_compile")
+        for i, elapsed in enumerate((10, 20, 30, 40, 50, 1000, 60)):
+            self.record(f"2026010{i + 1}000000", "llvm-native-22.1.8-r0",
+                        "do_compile", elapsed, 10000 + i * 2000)
+        self.assertEqual(self.load()[key], 50)
+        self.assertEqual(self.load()[key], 50)
+        # A copied archive with the same completed execution is not a new sample.
+        self.record("20260108000000", "llvm-native-22.1.8-r0",
+                    "do_compile", 60, 22000)
+        self.assertEqual(self.load()[key], 50)
+        with sqlite3.connect(self.root / "cache" / "tetris.sqlite3") as db:
+            rows = db.execute("SELECT ended, elapsed FROM timings_v2 ORDER BY ended").fetchall()
+        self.assertEqual(rows, [(14000, 30), (16000, 40), (18000, 50),
+                                (20000, 1000), (22000, 60)])
+        self.config["BB_TETRIS_HISTORY"] = ""
+        self.assertEqual(self.load()[key], 50)
+        del self.config["BB_TETRIS_HISTORY"]
+        shutil.rmtree(self.root / "tmp")
+        with self.assertLogs("BitBake.RunQueue.Tetris", level="WARNING"):
+            self.assertEqual(self.load()[key], 50)
+
+    def test_legacy_history_migrates_as_version_unknown_fallback(self):
+        key = ("llvm-native", "do_compile")
+        self.record("20260101000000", "llvm-native-22.1.3-r0",
+                    "do_compile", 7500, 10000)
+        self.load()
+        with sqlite3.connect(self.root / "cache" / "tetris.sqlite3") as db:
+            db.execute("CREATE TABLE timings_v1 AS "
+                       "SELECT scope, pn, task, ended, elapsed FROM timings_v2")
+            db.execute("DROP TABLE timings_v2")
+        shutil.rmtree(self.root / "tmp")
+        with self.assertLogs("BitBake.RunQueue.Tetris", level="WARNING"):
+            self.assertEqual(self.load(version="22.1.8")[key], 7500)
+        self.record("20260102000000", "llvm-native-22.1.8-r0",
+                    "do_compile", 6000, 20000)
+        self.assertEqual(self.load(version="22.1.8")[key], 6000)
+
+    def test_configuration_scopes_do_not_share_retained_timings(self):
+        self.record("20260101000000", "llvm-native-22.1.3-r0",
+                    "do_compile", 7500, 10000)
+        self.load()
+        shutil.rmtree(self.root / "tmp")
+        for variable, value in (("MACHINE", "qemuarm64"), ("DISTRO", "other"),
+                                ("BB_NUMBER_THREADS", "16"), ("PARALLEL_MAKE", "-j 16")):
+            with self.subTest(variable=variable), \
+                 patch.dict(self.config, {variable: value}), \
+                 self.assertLogs("BitBake.RunQueue.Tetris", level="WARNING"):
+                self.assertEqual(self.load(), {})
+        with self.assertLogs("BitBake.RunQueue.Tetris", level="WARNING"):
+            self.assertEqual(self.load()[("llvm-native", "do_compile")], 7500)
+
+    def test_disabled_or_broken_persistence_still_merges_snapshots(self):
+        self.record("20260101000000", "llvm-native-22.1.3-r0",
+                    "do_compile", 7500, 10000)
+        self.record("20260102000000", "small-1.0-r0", "do_compile", 13, 20000)
+        self.config["BB_TETRIS_HISTORY"] = ""
+        self.assertEqual(self.load()[("llvm-native", "do_compile")], 7500)
+        self.assertFalse((self.root / "cache").exists())
+        invalid = self.root / "invalid.sqlite3"
+        invalid.write_text("not a database")
+        self.config["BB_TETRIS_HISTORY"] = str(invalid)
+        with self.assertLogs("BitBake.RunQueue.Tetris", level="WARNING") as logs:
+            self.assertEqual(self.load()[("llvm-native", "do_compile")], 7500)
+        self.assertTrue(any("cannot update timing history" in line for line in logs.output))
 
 
 class TetrisSimulationTests(unittest.TestCase):

@@ -18,11 +18,25 @@
 #
 #   real_weight = alpha * weight_time + beta * unblock_score
 #
-# No sidecar file is required. On the first ever build in a fresh TMPDIR the
-# buildstats dir is empty; the scheduler then degrades gracefully to using a
-# neutral weight_time for every task, and the unblock_score alone still ranks
-# tasks meaningfully (it comes from the live graph). Every subsequent build
-# picks up the newest buildstats snapshot automatically.
+# Successful buildstats observations are merged into a persistent timing cache.
+# A setscene hit or skipped task retains its normal-task observations. Without
+# history, static weights are neutral and adaptive durations use defaults.
+# History is imported at scheduler startup: retain or archive buildstats before
+# deleting TMPDIR, and point BB_TETRIS_BUILDSTATS at that archive on the next run.
+# Buildstats do not record the full configuration: all supplied snapshots must
+# come from a compatible setup. After changing configurations, use a separate
+# buildstats directory; cache scoping cannot identify incompatible source data.
+#
+# The cache is scoped by machine, distro, target/build system, tuning, and
+# parallelism across configured multiconfigs. Recipe-specific overrides are not
+# fingerprinted; use separate BB_TETRIS_HISTORY paths for incompatible setups.
+# Estimates use the median of the five most recent successful observations per
+# recipe version/revision and task. Prefer versions in the current runqueue;
+# without matching observations, use the most recently observed version.
+# A single observation is used as-is; even-sized windows average the middle two.
+# Reimporting an archive does not add duplicate samples. Older single-value
+# caches are migrated as version-unknown fallback observations.
+# These are scheduling hints, never task signatures.
 #
 # The default coefficients (alpha=0.5, beta=3.0) and aggregation ('max') were
 # picked via grid search on core-image-minimal buildstats; see
@@ -55,17 +69,25 @@
 #   BB_TETRIS_AGG              = "max"    # 'max' or 'sum' downstream aggregation
 #   BB_TETRIS_RESOLUTION       = "20"     # log-quantization buckets (sweep-optimum)
 #   BB_TETRIS_BUILDSTATS       = "${TMPDIR}/buildstats"   # override source dir
+#   BB_TETRIS_HISTORY         = "${PERSISTENT_DIR}/tetris.sqlite3"
+#       Defaults to PERSISTENT_DIR, or TOPDIR/cache, outside TMPDIR in OE.
+#       Set to "" to disable persistence (available snapshots still merge).
 #   BB_TETRIS_DEFER_FETCH      = "0"      # 1 enables experimental fetch deferral
 #   BB_TETRIS_FETCH_SLACK_PCT  = "1.0"    # slack > pct*makespan => defer fetch
 #
 # SPDX-License-Identifier: MIT
 #
 
+import contextlib
+import json
 import logging
 import math
 import os
 import re
+import sqlite3
+import statistics
 import time
+from collections import defaultdict
 
 from bb.runqueue import RunQueueScheduler, split_tid_mcfn
 
@@ -93,6 +115,7 @@ DEFAULT_RESOLUTION = 20
 DEFAULT_DEFER_FETCH = False
 DEFAULT_FETCH_SLACK_PCT = 1.0
 DEFAULT_DYNAMIC = True
+_HISTORY_WINDOW = 5
 
 # Clamp for log10; 10ms is well below any scheduling-relevant granularity.
 _MIN_ELAPSED = 0.01
@@ -233,10 +256,7 @@ class RunQueueSchedulerTetris(RunQueueScheduler):
             self._resolve_tunables()
         )
 
-        # Load raw elapsed times from ${TMPDIR}/buildstats (or override) and
-        # log-normalize them into weight_time in [1, resolution]. No JSON,
-        # no manual regeneration step -- every rebuild reflects the latest
-        # available timings.
+        # Merge observed times with retained history before computing priorities.
         bs_path = self._resolve_buildstats_path()
         timings, source = self._load_timings_from_buildstats(bs_path)
         weight_time_lookup = self._log_normalize_timings(timings, resolution)
@@ -403,96 +423,147 @@ class RunQueueSchedulerTetris(RunQueueScheduler):
         return None
 
     def _load_timings_from_buildstats(self, base):
-        """Walk `base` and return ({(pn, taskname): elapsed_seconds}, source_str).
-
-        Layout (from buildstats.bbclass):
-            <base>/<timestamp>/<pn>-<pv>-<pr>/<taskname>
-        Each task file has an 'Elapsed time: N.NN seconds' line.
-
-        If `base` itself contains one or more timestamp subdirs, the newest
-        one that actually holds recipe subdirs is used -- that's the snapshot
-        of the previous build. On any failure (missing dir, empty dir, no
-        elapsed lines) returns an empty dict; the scheduler then degrades to
-        pure downstream-fanout scoring.
-        """
-        if not base or not os.path.isdir(base):
-            logger.warning(
-                "Tetris: buildstats dir %s not found; every task will use "
-                "default weight_time=%d. Inherit 'buildstats' in local.conf "
-                "so the next build has timing data.",
-                base, DEFAULT_WEIGHT_TIME,
-            )
-            return {}, "<missing>"
-
-        scan_dir = base
-        try:
-            entries = sorted(
-                os.path.join(base, n) for n in os.listdir(base)
-                if os.path.isdir(os.path.join(base, n))
-            )
-        except OSError as exc:
-            logger.warning("Tetris: cannot list %s (%s); using defaults", base, exc)
-            return {}, "<unreadable>"
-
-        # If every subdir is a timestamp, descend into the newest one that
-        # actually contains recipe dirs.
-        if entries and all(_TIMESTAMP_RE.match(os.path.basename(p)) for p in entries):
-            entries.sort(reverse=True)
-            for cand in entries:
+        """Merge successful observations and return rolling-median PN/task estimates."""
+        observations = {}
+        if base:
+            try:
+                entries = sorted(
+                    os.path.join(base, n) for n in os.listdir(base)
+                    if os.path.isdir(os.path.join(base, n))
+                )
+            except OSError as exc:
+                logger.warning("Tetris: cannot read buildstats %s (%s); using retained history",
+                               base, exc)
+                entries = []
+            snapshots = [p for p in entries if _TIMESTAMP_RE.fullmatch(os.path.basename(p))]
+            for snapshot in snapshots or ([base] if entries else []):
                 try:
-                    if any(
-                        os.path.isdir(os.path.join(cand, n))
-                        for n in os.listdir(cand)
-                    ):
-                        scan_dir = cand
-                        break
-                except OSError:
-                    continue
+                    self._read_snapshot(snapshot, observations)
+                except OSError as exc:
+                    logger.warning("Tetris: cannot read snapshot %s (%s)", snapshot, exc)
 
+        cfg = self.rq.cfgData
+        history = cfg.getVar("BB_TETRIS_HISTORY")
+        if history is None:
+            directory = cfg.getVar("PERSISTENT_DIR")
+            if not directory and cfg.getVar("TOPDIR"):
+                directory = os.path.join(cfg.getVar("TOPDIR"), "cache")
+            history = os.path.join(directory, "tetris.sqlite3") if directory else None
+            if not history:
+                logger.warning("Tetris: no history location; set BB_TETRIS_HISTORY or TOPDIR")
+        source = base or "<missing>"
+        if history:
+            scope_vars = (
+                "MACHINE", "DISTRO", "SDKMACHINE", "BUILD_SYS", "TARGET_SYS",
+                "TUNE_FEATURES", "BB_NUMBER_THREADS", "PARALLEL_MAKE", "PARALLEL_MAKEINST",
+            )
+            scope = json.dumps({
+                mc: {var: data.getVar(var) for var in scope_vars}
+                for mc, data in self.rq.cooker.databuilder.mcdata.items()
+            }, sort_keys=True)
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(history)), exist_ok=True)
+                with contextlib.closing(sqlite3.connect(history)) as db, db:
+                    db.execute("""
+                        CREATE TABLE IF NOT EXISTS timings_v2 (
+                            scope TEXT, pn TEXT, task TEXT, recipe TEXT,
+                            ended REAL, elapsed REAL,
+                            PRIMARY KEY (scope, pn, task, recipe, ended))
+                    """)
+                    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                                  "AND name='timings_v1'").fetchone():
+                        db.execute("""
+                            INSERT OR IGNORE INTO timings_v2
+                            SELECT scope, pn, task, '', ended, elapsed FROM timings_v1
+                        """)
+                        db.execute("DROP TABLE timings_v1")
+                    db.executemany("""
+                        INSERT INTO timings_v2 VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(scope, pn, task, recipe, ended) DO UPDATE SET
+                            elapsed=MAX(timings_v2.elapsed, excluded.elapsed)
+                    """, [(scope, *key, elapsed) for key, elapsed in observations.items()])
+                    db.execute("""
+                        DELETE FROM timings_v2 WHERE rowid IN (
+                            SELECT rowid FROM (
+                                SELECT rowid, ROW_NUMBER() OVER (
+                                    PARTITION BY pn, task, recipe ORDER BY ended DESC
+                                ) AS position FROM timings_v2 WHERE scope=?
+                            ) WHERE position > ?
+                        )
+                    """, (scope, _HISTORY_WINDOW))
+                    retained = {
+                        (pn, task, recipe, ended): elapsed
+                        for pn, task, recipe, ended, elapsed in db.execute(
+                            "SELECT pn, task, recipe, ended, elapsed FROM timings_v2 WHERE scope=?",
+                            (scope,))
+                    }
+                observations = retained
+                source = "%s + %s" % (source, history)
+            except (OSError, sqlite3.Error) as exc:
+                logger.warning("Tetris: cannot update timing history %s (%s); "
+                               "using available buildstats only", history, exc)
+        if not observations:
+            logger.warning("Tetris: no successful timing history from %s; using defaults", source)
+        return self._history_medians(observations), source
+
+    def _history_medians(self, observations):
+        versions = defaultdict(set)
+        for tid in self.rqdata.runtaskentries:
+            mc, _fn, task, taskfn = split_tid_mcfn(tid)
+            cache = self.rqdata.dataCaches[mc]
+            pn = cache.pkg_fn[taskfn]
+            _pe, pv, pr = cache.pkg_pepvpr[taskfn]
+            versions[pn, task].add("%s-%s-%s" % (pn, pv, pr))
+
+        grouped = defaultdict(list)
+        for (pn, task, recipe, ended), elapsed in observations.items():
+            grouped[pn, task].append((ended, recipe, elapsed))
         timings = {}
-        try:
-            recipe_dirs = sorted(os.listdir(scan_dir))
-        except OSError as exc:
-            logger.warning("Tetris: cannot list %s (%s); using defaults", scan_dir, exc)
-            return {}, "<unreadable>"
+        for key, samples in grouped.items():
+            matching = [sample for sample in samples if sample[1] in versions[key]]
+            if not matching:
+                # Prefer a known version over migrated legacy data on timestamp ties.
+                recipe = max(samples)[1]
+                matching = [sample for sample in samples if sample[1] == recipe]
+            recent = sorted(matching, reverse=True)[:_HISTORY_WINDOW]
+            timings[key] = statistics.median(sample[2] for sample in recent)
+        return timings
 
-        for recipe_name in recipe_dirs:
-            recipe_path = os.path.join(scan_dir, recipe_name)
+    def _read_snapshot(self, snapshot, observations):
+        for recipe_name in sorted(os.listdir(snapshot)):
+            recipe_path = os.path.join(snapshot, recipe_name)
             if not os.path.isdir(recipe_path):
                 continue
-            m = _PN_RE.match(recipe_name)
-            pn = m.group('pn') if m else recipe_name
-            try:
-                task_names = os.listdir(recipe_path)
-            except OSError:
-                continue
-            for task_name in task_names:
-                if not task_name.startswith('do_'):
+            match = _PN_RE.match(recipe_name)
+            pn = match.group('pn') if match else recipe_name
+            for task_name in sorted(os.listdir(recipe_path)):
+                if not task_name.startswith("do_"):
                     continue
-                task_path = os.path.join(recipe_path, task_name)
+                path = os.path.join(recipe_path, task_name)
                 try:
-                    with open(task_path, errors='ignore') as fh:
-                        text = fh.read()
-                except OSError:
+                    with open(path, errors="replace") as stream:
+                        text = stream.read()
+                except OSError as exc:
+                    logger.warning("Tetris: cannot read timing %s (%s)", path, exc)
                     continue
-                em = _ELAPSED_RE.search(text)
-                if not em:
-                    continue
-                try:
-                    elapsed = float(em.group(1))
-                except ValueError:
-                    continue
-                key = (pn, task_name)
-                # Keep max if the same task appears twice (multiconfig).
-                if elapsed > timings.get(key, -1.0):
-                    timings[key] = elapsed
-
-        if not timings:
-            logger.warning(
-                "Tetris: no Elapsed timings found under %s; using defaults",
-                scan_dir,
-            )
-        return timings, scan_dir
+                for record in text.split("Event: TaskStarted"):
+                    if not re.search(r"^Status: PASSED\s*$", record, re.MULTILINE):
+                        continue
+                    elapsed = _ELAPSED_RE.search(record)
+                    ended = re.search(r"^Ended:\s*([\d.]+)", record, re.MULTILINE)
+                    try:
+                        if not elapsed or not ended:
+                            raise ValueError("missing elapsed/completion time")
+                        value = (float(ended.group(1)), float(elapsed.group(1)))
+                        if value[1] == 0:
+                            continue
+                        if not all(math.isfinite(v) and v > 0 for v in value):
+                            raise ValueError("non-positive/non-finite timing")
+                    except ValueError as exc:
+                        logger.warning("Tetris: invalid timing in %s (%s)", path, exc)
+                        continue
+                    key = (pn, task_name, recipe_name, value[0])
+                    observations[key] = max(value[1], observations.get(key, 0))
 
     def _log_normalize_timings(self, timings, resolution):
         """{(pn, task): elapsed_seconds} -> {(pn, task): int in [1, resolution]}.
